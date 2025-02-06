@@ -9,18 +9,31 @@ from pathlib import Path
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+import numpy as np
+import logging
+
+# Add logging configuration at the top after imports
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+
+# Create limiter before FastAPI app
+limiter = Limiter(key_func=get_remote_address)
 
 app = FastAPI(
     title="RTDC File API",
     description="API for serving RTDC file metadata"
 )
 
-# Rate limiter setup
-limiter = Limiter(key_func=get_remote_address)
+# Store the path in app state instead of global variable
+app.state.RTDC_FILE_PATH = Path("datasets/S8_Lung_Healthy.rtdc")
+
+# Set up rate limiter
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# CORS Middleware - should be first
+# Add middleware in correct order
+# 1. CORS middleware first
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173"],
@@ -30,10 +43,13 @@ app.add_middleware(
     expose_headers=["X-Content-Type-Options", "X-Frame-Options"]
 )
 
-# Other middleware follows
+# 2. Rate limiting middleware
+app.add_middleware(SlowAPIMiddleware)
+
+# 3. Trusted host middleware
 app.add_middleware(
     TrustedHostMiddleware, 
-    allowed_hosts=["localhost", "127.0.0.1"]
+    allowed_hosts=["localhost", "127.0.0.1", "*"]  # Added "*" for testing
 )
 
 # Security headers middleware
@@ -50,34 +66,43 @@ async def add_security_headers(request: Request, call_next):
     # response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     return response
 
-# Configure this path to point to your .rtdc file
-RTDC_FILE_PATH = Path("datasets/S8_Lung_Healthy.rtdc")
-
 @app.get("/metadata")
-@limiter.limit("5/minute")  # Limit to 5 requests per minute per IP
+@limiter.limit("5/minute")
 async def get_metadata(request: Request):
     """Return metadata from the RTDC file"""
-    if not RTDC_FILE_PATH.exists():
+    file_path = app.state.RTDC_FILE_PATH
+    logger.debug(f"Checking file: {file_path} (exists: {file_path.exists()})")
+    
+    if not file_path.exists():
+        logger.debug(f"File not found: {file_path}")
         raise HTTPException(status_code=404, detail="RTDC file not found")
     
     try:
-        with h5py.File(RTDC_FILE_PATH, 'r') as f:
-            # Extract basic metadata
+        with h5py.File(file_path, 'r') as f:
+            logger.debug(f"File attributes: {dict(f.attrs)}")
+            
             metadata = {
-                "filename": RTDC_FILE_PATH.name,
+                "filename": file_path.name,
                 "groups": list(f.keys()),
-                "attributes": dict(f.attrs)
+                "attributes": {}
             }
             
-            # Convert any numpy types to native Python types for JSON serialization
-            metadata["attributes"] = {
-                k: v.item() if hasattr(v, 'item') else v 
-                for k, v in metadata["attributes"].items()
-            }
+            # Convert HDF5 attributes to Python types
+            for key, value in f.attrs.items():
+                logger.debug(f"Processing attribute {key}: {type(value)} = {value}")
+                if isinstance(value, (np.ndarray, np.generic)):
+                    if value.dtype.kind in ['S', 'U']:
+                        metadata["attributes"][key] = value.astype(str).item()
+                    else:
+                        metadata["attributes"][key] = value.item()
+                else:
+                    metadata["attributes"][key] = value
             
+            logger.debug(f"Final metadata: {metadata}")
             return metadata
             
     except Exception as e:
+        logger.exception("Error reading RTDC file")
         raise HTTPException(
             status_code=500, 
             detail=f"Error reading RTDC file: {str(e)}"
